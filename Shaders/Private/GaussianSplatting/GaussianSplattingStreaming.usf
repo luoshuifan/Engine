@@ -1,0 +1,14 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../ComputeShaderUtils.ush"
+#include "GaussianSplattingStreaming.ush"
+
+RWStructuredBuffer<FStreamingRequest>	OutStreamingRequests;
+
+[numthreads(1, 1, 1)]
+void ClearStreamingRequestCount()
+{
+	OutStreamingRequests[0].RuntimeResourceID_Magic = 0;	// First entry holds count
+}
+

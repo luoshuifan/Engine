@@ -1,0 +1,18 @@
+{
+    "project_id":"65f9052cb538d34df4abb57d",
+    "scene":"ue4",
+	"server_host":"http://bkdistcc.ied.com:30111/api",
+	"batch_mode":true,
+	"specific_host_list":[],
+	"need_apply":true,
+	"build_id":"",
+	"shader_tool_idle_run_seconds":120,
+	"controller_idle_run_seconds":120,
+	"controller_no_batch_wait":true,
+	"controller_send_cork":true,
+	"env":{
+		"BK_DIST_LOG_LEVEL":"info",
+		"BK_DIST_UE4_MAX_JOBS":"288",
+		"BK_DIST_IDLE_KEEP_SECS":"30"
+	}
+}

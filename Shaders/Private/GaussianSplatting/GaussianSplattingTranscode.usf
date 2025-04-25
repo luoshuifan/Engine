@@ -1,0 +1,165 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+#include "../ComputeShaderUtils.ush"
+#include "/Engine/Shared/GaussianDefinitions.h"
+
+struct FClusterInstallInfo
+{
+	uint LocalPageIndex;
+	uint LocalClusterIndex;
+
+	uint SrcPageOffset;
+	uint DstPageOffset;
+	uint PageDependenciesOffset;
+};
+
+struct FPackedClusterInstallInfo
+{
+	uint LocalPageIndex_LocalClusterIndex;
+	uint SrcPageOffset;
+	uint DstPageOffset;
+	uint PageDependenciesOffset;
+};
+
+struct FPageDiskHeader
+{
+	uint NumClusters;
+	uint NumRawFloat4s;
+	uint NumVertexRefs;
+	uint DecodeInfoOffset;
+	uint StripBitmaskOffset;
+	uint VertexRefBitmaskOffset;
+};
+#define SIZEOF_PAGE_DISK_HEADER	(6*4)
+
+struct FClusterDiskHeader
+{
+	uint IndexDataOffset;
+	uint PageClusterMapOffset;
+	uint VertexRefDataOffset;
+	uint LowBytesDataOffset;
+	uint MidBytesDataOffset;
+	uint HighBytesDataOffset;
+	uint NumVertexRefs;
+	uint NumPrevRefVerticesBeforeDwords;
+	uint NumPrevNewVerticesBeforeDwords;
+};
+
+#define SIZEOF_CLUSTER_DISK_HEADER	(9*4)
+
+uint										StartClusterIndex;
+uint										NumClusters;
+uint										ZeroUniform;
+StructuredBuffer<FPackedClusterInstallInfo>	ClusterInstallInfoBuffer;
+StructuredBuffer<uint>						PageDependenciesBuffer;
+ByteAddressBuffer							SrcPageBuffer;
+RWByteAddressBuffer							DstPageBuffer;
+
+
+FPageDiskHeader GetPageDiskHeader(uint PageBaseOffset)
+{
+	const uint4 Data0 = SrcPageBuffer.Load4(PageBaseOffset + 0);
+	const uint2 Data1 = SrcPageBuffer.Load2(PageBaseOffset + 16);
+
+	FPageDiskHeader DiskHeader;
+	DiskHeader.NumClusters				= Data0.x;
+	DiskHeader.NumRawFloat4s			= Data0.y;
+	DiskHeader.NumVertexRefs			= Data0.z;
+	DiskHeader.DecodeInfoOffset			= Data0.w;
+	DiskHeader.StripBitmaskOffset		= Data1.x;
+	DiskHeader.VertexRefBitmaskOffset	= Data1.y;
+	return DiskHeader;
+}
+
+FClusterDiskHeader GetClusterDiskHeader(uint PageBaseOffset, uint ClusterIndex)
+{
+	const uint ByteOffset = PageBaseOffset + SIZEOF_PAGE_DISK_HEADER + ClusterIndex * SIZEOF_CLUSTER_DISK_HEADER;
+	
+	const uint4 Data0 = SrcPageBuffer.Load4(ByteOffset);
+	const uint4 Data1 = SrcPageBuffer.Load4(ByteOffset + 16);
+	const uint  Data2 = SrcPageBuffer.Load(ByteOffset + 32);
+	
+	FClusterDiskHeader Header;
+	Header.IndexDataOffset					= Data0.x;
+	Header.PageClusterMapOffset				= Data0.y;
+	Header.VertexRefDataOffset				= Data0.z;
+	Header.LowBytesDataOffset				= Data0.w;
+	Header.MidBytesDataOffset				= Data1.x;
+	Header.HighBytesDataOffset				= Data1.y;
+	Header.NumVertexRefs					= Data1.z;
+	Header.NumPrevRefVerticesBeforeDwords	= Data1.w;
+	Header.NumPrevNewVerticesBeforeDwords	= Data2;
+	return Header;
+}
+
+FClusterInstallInfo GetClusterInstallInfo(uint Index)
+{
+	const FPackedClusterInstallInfo PackedData = ClusterInstallInfoBuffer[Index];
+	
+	FClusterInstallInfo Info;
+	Info.LocalPageIndex = PackedData.LocalPageIndex_LocalClusterIndex >> GAUSSIANSPLATTING_MAX_CLUSTERS_PER_PAGE_BITS;
+	
+	Info.LocalClusterIndex = BitFieldExtractU32(PackedData.LocalPageIndex_LocalClusterIndex, GAUSSIANSPLATTING_MAX_CLUSTERS_PER_PAGE_BITS, 0);
+	Info.LocalClusterIndex		+= ZeroUniform;		// Temporary workaround for compiler bug: Force promotion from 24bit to 32bit to work around console compiler bug
+	Info.SrcPageOffset			= PackedData.SrcPageOffset;
+	Info.DstPageOffset			= PackedData.DstPageOffset;
+	Info.PageDependenciesOffset = PackedData.PageDependenciesOffset;
+	return Info;
+}
+
+void TranscodePageIndependent(uint ClusterInstallIndex, uint WaveNumActiveLanes, uint GroupIndex)
+{
+	const FClusterInstallInfo ClusterInstallInfo	= GetClusterInstallInfo(ClusterInstallIndex);
+
+	const uint SrcPageBaseOffset					= ClusterInstallInfo.SrcPageOffset;
+	const uint DstPageBaseOffset					= ClusterInstallInfo.DstPageOffset;
+	
+	const FPageDiskHeader PageDiskHeader			= GetPageDiskHeader(SrcPageBaseOffset);
+
+	const uint SrcPackedClusterOffset				= SrcPageBaseOffset + SIZEOF_PAGE_DISK_HEADER + PageDiskHeader.NumClusters * SIZEOF_CLUSTER_DISK_HEADER;
+	const uint DstPackedClusterOffset				= DstPageBaseOffset;
+
+	// Raw copy: FPackedClusters, Material Dwords and DecodeInfo.
+	if (ClusterInstallInfo.LocalClusterIndex == 0)
+	{
+		const uint NumRawFloat4s = PageDiskHeader.NumRawFloat4s;
+		for (uint i = GroupIndex; i < NumRawFloat4s; i += WaveNumActiveLanes)
+		{
+			uint4 Data = SrcPageBuffer.Load4(SrcPackedClusterOffset + i * 16);
+			DstPageBuffer.Store4(DstPackedClusterOffset + i * 16, Data);
+		}
+	}
+}
+
+
+#if COMPILER_SUPPORTS_WAVE_SIZE
+WAVESIZE(GROUP_SIZE)
+#endif
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void TranscodePageToGPU(uint3 GroupID : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint FlatGroupID = GetUnWrappedDispatchGroupId(GroupID);
+	if (FlatGroupID >= NumClusters)
+	{
+		return;
+	}
+
+	const uint ClusterInstallIndex = StartClusterIndex + FlatGroupID;
+	if (GroupIndex >= WaveGetLaneCount())
+	{
+		// Workaround for any platform that might not support setting the wave size explicitly
+		return;
+	}
+
+	const uint WaveNumActiveLanes = min(WaveGetLaneCount(), GROUP_SIZE);
+
+#if GAUSSIANSPLATTING_TRANSCODE_PASS == GAUSSIANSPLATTING_TRANSCODE_PASS_INDEPENDENT
+	TranscodePageIndependent(ClusterInstallIndex, WaveNumActiveLanes, GroupIndex);
+#elif GAUSSIANSPLATTING_TRANSCODE_PASS == GAUSSIANSPLATTING_TRANSCODE_PASS_PARENT_DEPENDENT
+	//TranscodePageParentDependent(ClusterInstallIndex, WaveNumActiveLanes, GroupIndex);
+#endif
+}
+
