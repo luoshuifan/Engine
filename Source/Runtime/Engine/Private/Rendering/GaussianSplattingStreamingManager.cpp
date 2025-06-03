@@ -230,6 +230,14 @@ IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/Gaussia
 		);
 	}
 
+	static void AddPass_UpdateClusterLeafFlages(FRDGBuilder& GraphBuilder, FRDGBufferUAVRef ClusterPageBufferUAV, const TArray<uint32>& PackedUpdates)
+	{
+		
+
+
+	}
+
+
 	struct FPackedClusterInstallInfo
 	{
 		uint32 LocalPageIndex_LocalClusterIndex;
@@ -639,6 +647,38 @@ IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/Gaussia
 			WriteOffset = 0;
 		}
 
+		bool TryAllocate(uint32 Size, uint32& AllocatedOffset)
+		{
+			if (WriteOffset < ReadOffset)
+			{
+				if (Size + 1u > ReadOffset - WriteOffset)
+				{
+					return false;
+				}
+			}
+			else
+			{
+				if (Size + (ReadOffset == 0u ? 1u : 0u) > BufferSize - WriteOffset)
+				{
+					if (Size + 1u > ReadOffset)
+					{
+						return false;
+					}
+					WriteOffset = 0u;
+				}
+			}
+
+			AllocatedOffset = WriteOffset;
+			WriteOffset += Size;
+			check(AllocatedOffset + Size <= BufferSize);
+			return true;
+		}
+
+		void Free(uint32 Size)
+		{
+			const uint32 Next = ReadOffset + Size;
+			ReadOffset = (Next <= BufferSize) ? Next : Size;
+		}
 
 	private:
 		uint32 BufferSize;
@@ -1023,6 +1063,53 @@ IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/Gaussia
 
 	}
 
+	void FStreamingManager::RegisterStreamingPage(uint32 RegisteredPageIndex, const FPageKey & Key)
+	{
+		LLM_SCOPE_BYTAG(GaussianSplatting);
+		
+		FResources* Resources = GetResources(Key.RuntimeResourceID);
+		check(Resources != nullptr);
+		check(!Resources->IsRootPage(Key.PageIndex));
+
+		TArray<FPageStreamingState>& PageStreamingStates = Resources->PageStreamingState;
+		FPageStreamingState& PageStreamingState = PageStreamingStates[Key.PageIndex];
+
+		const uint32 VirtualPageRageStart = RootPageInfos[Resources->RootPageIndex].VirtualPageRangeStart;
+
+		FRegisteredPage& RegisteredPage = RegisteredPages[RegisteredPageIndex];
+		RegisteredPage = FRegisteredPage();
+		RegisteredPage.Key = Key;
+		RegisteredPage.VirtualPageIndex = VirtualPageRageStart + Key.PageIndex;
+
+		RegisteredVirtualPages[RegisteredPage.VirtualPageIndex].RegisteredPageIndex = RegisteredPageIndex;
+		MoveToEndOfLRUList(RegisteredPageIndex);
+	}
+
+	void FStreamingManager::UnregisterStreamingPage(const FPageKey& Key)
+	{
+		LLM_SCOPE_BYTAG(GaussianSplatting);
+
+		if (Key.RuntimeResourceID == INDEX_NONE)
+		{
+			return;
+		}
+
+		const FRootPageInfo* RootPage = GetRootPage(Key.RuntimeResourceID);
+		check(RootPage);
+		const FResources* Resources = RootPage->Resource;
+		check(Resources != nullptr);
+		check(!Resources->IsRootPage(Key.PageIndex));
+
+		const uint32 VirtualPageRageStart = RootPage->VirtualPageRangeStart;
+		
+		const uint32 RegisteredPageIndex = RegisteredVirtualPages[VirtualPageRageStart + Key.PageIndex].RegisteredPageIndex;
+		check(RegisteredPageIndex != INDEX_NONE);
+		FRegisteredPage& RegisteredPage = RegisteredPages[RegisteredPageIndex];
+
+		RegisteredVirtualPages[RegisteredPage.VirtualPageIndex] = FVirtualPage();
+		RegisteredPage = FRegisteredPage();
+	}
+
 	void FStreamingManager::SelectHighestPriorityPagesAndUpdateLRU(uint32 MaxSelectedPages)
 	{
 		SCOPE_CYCLE_COUNTER(STAT_GaussianSplattingStreaming_SelectHighestPriority);
@@ -1248,7 +1335,6 @@ IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/Gaussia
 
 		check(AsyncState.bUpdateActive);
 
-
 		const uint32 StartTime = FPlatformTime::Cycles();
 
 		if (AsyncState.GPUStreamingRequestsPtr)
@@ -1319,20 +1405,81 @@ IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/Gaussia
 
 					{
 						uint32 AllocatedOffset;
-						//if(!PendingPageStagingAllocator->)
+						if (!PendingPageStagingAllocator->TryAllocate(PageStreamingState.BulkSize, AllocatedOffset))
+						{
+							break;
+						}
+						uint8* Dst = PendingPageStagingMemory.GetData() + AllocatedOffset;
+						PendingPage.RequestBuffer = FIoBuffer(FIoBuffer::Wrap, Dst, PageStreamingState.BulkSize);
+						Batch.Read(BulkData, PageStreamingState.BulkOffset, PageStreamingState.BulkSize, AIOP_Low, PendingPage.RequestBuffer);
+						bIssueIOBatch = true;
 
+						if (bLegacyRequest)
+						{
+							++NumLegacyRequestsIssued;
+						}
 					}
 
+					UnregisterStreamingPage(Page->Key);
 
+					PendingPage.InstallKey = SelectedKey;
+					PendingPage.BytesLeftToStream = PageStreamingState.BulkSize;
+					const uint32 GPUPageIndex = uint32(Page - RegisteredPages.GetData());
+					PendingPage.GPUPageIndex = GPUPageIndex;
 
+					NextPendingPageIndex = (NextPendingPageIndex + 1) % MaxPendingPages;
+					++NumPendingPages;
+
+					RegisterStreamingPage(GPUPageIndex, SelectedKey);
 				}
-
-
-
 			}
 
-
+			if(bIssueIOBatch)
+			{
+			    TRACE_CPUPROFILER_EVENT_SCOPE(FIoBatch::Issue);
+				Batch.Issue();
+			}
 		}
+
+		CompactLRU();
+	}
+
+	void FStreamingManager::EndAsyncUpdate(FRDGBuilder& GraphBuilder)
+	{
+		check(IsInRenderingThread());
+		if (!DoesPlatformSupportGS(GMaxRHIShaderPlatform))
+		{
+			return;
+		}
+
+		LLM_SCOPE_BYTAG(GaussianSplatting);
+		TRACE_CPUPROFILER_EVENT_SCOPE(FStreamingManager::EndAsyncUpdate);
+
+		RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplattingStreaming, "GS::EndAsyncUpdate");
+		RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplattingStreaming);
+
+		RDG_GPU_MASK_SCOPE(GraphBuilder, FRHIGPUMask::All());
+		SCOPE_CYCLE_COUNTER(STAT_GaussianSplattingStreaming_EndAsyncUpdate);
+
+		check(AsyncState.bUpdateActive);
+
+		AsyncTaskEvents.Empty();
+
+		if (AsyncState.GPUStreamingRequestsPtr)
+		{
+			ReadbackManager->Unlock();
+		}
+
+		if (AsyncState.NumReadyPages > 0)
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(UploadPages);
+
+			const FRDGBufferRef ClusterPageDataBuffer = GraphBuilder.RegisterExternalBuffer(ClusterPageData.DataBuffer);
+			PageUploader->ResourceUploadTo(GraphBuilder, ClusterPageDataBuffer);
+			Hierarchy.UploadBuffer.ResourceUploadTo(GraphBuilder, GraphBuilder.RegisterExternalBuffer(Hierarchy.DataBuffer));
+			
+		}
+
 
 
 

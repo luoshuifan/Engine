@@ -1251,6 +1251,21 @@ bool DoesPlatformSupportNanite(EShaderPlatform Platform, bool bCheckForProjectSe
 	return bFullCheck;
 }
 
+bool DoesPlatformSupportGS(EShaderPlatform Platform, bool bCheckForProjectSetting)
+{
+	return true;
+}
+
+bool DoesRuntimeSupportGS(EShaderPlatform ShaderPlatform, bool bCheckForAtomicSupport, bool bCheckForProjectSetting)
+{
+	return true;
+}
+
+bool DoesTargetPlatformSupportGS(const ITargetPlatform* TargetPlatform)
+{
+	return true;
+}
+
 bool NaniteAtomicsSupported()
 {
 	// Are 64bit image atomics supported by the GPU/Driver/OS/API?

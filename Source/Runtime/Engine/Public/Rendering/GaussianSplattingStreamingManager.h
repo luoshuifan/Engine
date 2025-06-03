@@ -241,6 +241,7 @@ private:
 	void AddParentRegisteredRequestsRecursive(uint32 RegisteredPageIndex, uint32 Priority);
 
 	void RegisterStreamingPage(uint32 RegisteredPageIndex, const FPageKey& Key);
+	void UnregisterStreamingPage(const FPageKey& Key);
 
 	void SelectHighestPriorityPagesAndUpdateLRU(uint32 MaxSelectedPages);
 
