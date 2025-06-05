@@ -170,6 +170,9 @@ private:
 		uint8 MaxHierarchyDepth = 0xFF;
 	};
 
+
+	uint64 PrevUpdateTick = 0u;
+
 	TArray<FResources*> PendingAdds;
 
 	TMultiMap<uint32, FResources*> PersistenHashResourceMap;
@@ -190,6 +193,9 @@ private:
 	FHeapBuffer Hierarchy;
 	TArray<uint32> ClusterLeafFlagUpdates;
 
+	TPimplPtr<class FHierarchyDepthManager> HierarchyDepthManager;
+	uint32 MaxHierarchyLevels = 0;
+
 	TPimplPtr<class FStreamingPageUploader> PageUploader;
 	TPimplPtr<class FReadbackManager> ReadbackManager;
 
@@ -201,6 +207,10 @@ private:
 
 	TArray<uint32> RegisteredPageIndexToLRU;
 	TArray<uint32> LRUToRegisteredPageIndex;
+
+	TArray<FResidentPage> ResidentPages;
+	TArray<FFixupChunk*> ResidentPageFixupChunks;
+	TMap<FPageKey, uint32> ResidentPageMap;
 
 	TArray<FRegisteredPage> RegisteredPages;
 
@@ -247,6 +257,13 @@ private:
 
 	void MoveToEndOfLRUList(uint32 RegisteredPageIndex);
 	void CompactLRU();
+
+	uint32 DetermineReadyPages(uint32& TotalPageSize);
+	void InstallReadyPages(uint32 NumReadyPages);
+	void UninstallGPUPage(uint32 GPUPageIndex, bool bApplyFixup);
+
+	void AddClusterLeafFlagUpdate(uint32 MaxStreamingPages, uint32 GPUPageIndex, uint32 ClusterIndex, uint32 NumCluster, bool bReset, bool bUninstall);
+	void FlushClusterLeafFlagUpdates(FRDGBuilder& GraphBuilder, FRDGBuffer* ClusterPageDataBuffer);
 
 	void AsyncUpdate();
 };

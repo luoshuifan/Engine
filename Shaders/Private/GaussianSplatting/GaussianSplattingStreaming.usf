@@ -12,3 +12,42 @@ void ClearStreamingRequestCount()
 	OutStreamingRequests[0].RuntimeResourceID_Magic = 0;	// First entry holds count
 }
 
+uint NumClusterUpdates;
+StructuredBuffer<uint> PackedClusterUpdates;
+RWByteAddressBuffer ClusterPageBuffer;
+
+[numthreads(64, 1, 1)]
+void UpdateClusterLeafFlags(uint DispatchThreadId : SV_DispatchThreadID)
+{
+	if(DispatchThreadId >= NumClusterUpdates)
+	{
+		return;
+	}
+	
+	const uint PackedUpdate = PackedClusterUpdates[DispatchThreadId];
+	const uint Offset = PackedUpdate & 0xFFFFFFFCu;
+	const bool bLeaf = (PackedUpdate & 1u) != 0u;
+	const bool bReset = (PackedUpdate & 2u) != 0u;
+	
+	if(bReset)
+	{
+		uint Flags = ClusterPageBuffer.Load(Offset);
+		
+		bool bRootLeaf = (Flags & GAUSSIANSPLATTING_CLUSTER_FLAG_ROOT_LEAF);
+		Flags &= ~GAUSSIANSPLATTING_CLUSTER_FLAG_STREAMING_LEAF;
+		Flags |= (bRootLeaf ? GAUSSIANSPLATTING_CLUSTER_FLAG_STREAMING_LEAF, 0u);
+		ClusterPageBuffer.Store(Offset, Flags);
+	}
+	else
+	{
+		if(bLeaf)
+		{
+			ClusterPageBuffer.InterlockedOr(Offset, GAUSSIANSPLATTING_CLUSTER_FLAG_STREAMING_LEAF);
+		}
+		else
+		{
+			ClusterPageBuffer.InterlockedAnd(Offset, ~GAUSSIANSPLATTING_CLUSTER_FLAG_STREAMING_LEAF);
+		}
+	}	
+	
+}

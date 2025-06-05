@@ -59,3 +59,8 @@
 #define GAUSSIANSPLATTING_NUM_STREAMING_PRIORITY_CATEGORY_BITS			2
 #define GAUSSIANSPLATTING_STREAMING_PRIORITY_CATEGORY_MASK				((1 << GAUSSIANSPLATTING_STREAMING_PRIORITY_CATEGORY_MASK) - 1)
 #define GAUSSIANSPLATTING_MAX_PRIORITY_BEFORE_PARENTS					0xFFFFFFE0u
+
+#define GAUSSIANSPLATTING_CLUSTER_FLAG_ROOT_LEAF						0x1		// Cluster is leaf when only root pages are streamed in
+#define GAUSSIANSPLATTING_CLUSTER_FLAG_STREAMING_LEAF					0x2		// Cluster is a leaf in the current streaming state
+#define GAUSSIANSPLATTING_CLUSTER_FLAG_FULL_LEAF						0x4		// Cluster is a leaf when fully streamed in
+#define GAUSSIANSPLATTING_CLUSTER_FLAG_ROOT_GROUP						0x8		// Cluster is in a group that is fully inside the root pages

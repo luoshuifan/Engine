@@ -103,6 +103,14 @@ static FAutoConsoleVariableRef CVarGaussianSplattingStreamingNumInitialRootPages
 	ECVF_RenderThreadSafe | ECVF_ReadOnly
 );
 
+static float GGaussianSplattingStreamingBandwidthLimit = -1.0f;
+static FAutoConsoleVariableRef CVarNaniteStreamingBandwidthLimit(
+	TEXT("r.GaussianSplatting.Streaming.BandwidthLimit" ),
+	GGaussianSplattingStreamingBandwidthLimit,
+	TEXT("Streaming bandwidth limit in megabytes per second. Negatives values are interpreted as unlimited. "),
+	ECVF_RenderThreadSafe
+);
+
 namespace GS
 {
 	#define MAX_RUNTIME_RESOURCE_VERSIONS_BITS	8								// Just needs to be large enough to cover maximum number of in-flight versions
@@ -210,6 +218,25 @@ IMPLEMENT_GLOBAL_SHADER(FTranscodePageToGPU_CS, "/Engine/Private/GaussianSplatti
 	};
 IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/GaussianSplatting/GaussianSplattingStreaming.usf", "ClearStreamingRequestCount", SF_Compute);
 
+	class FUpdateClusterLeafFlags_CS : public FGlobalShader
+	{
+		DECLARE_GLOBAL_SHADER(FUpdateClusterLeafFlags_CS);
+		SHADER_USE_PARAMETER_STRUCT(FUpdateClusterLeafFlags_CS, FGlobalShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, NumClusterUpdates)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, PackedClusterUpdates)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWByteAddressBuffer, ClusterPageBuffer)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return true;
+		}
+	};
+
+	IMPLEMENT_GLOBAL_SHADER(FUpdateClusterLeafFlags_CS, "/Engine/Private/GaussianSplatting/GaussianSplattingStreaming.usf", "UpdateClusterLeafFlags", SF_Compute);
+
 	static void AddPass_ClearStreamingRequestCount(FRDGBuilder& GraphBuilder, FRDGBufferUAVRef BufferUAVRef)
 	{
 		// Need to always clear streaming requests on all GPUs.  We sometimes write to streaming request buffers on a mix of
@@ -230,12 +257,68 @@ IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/Gaussia
 		);
 	}
 
-	static void AddPass_UpdateClusterLeafFlages(FRDGBuilder& GraphBuilder, FRDGBufferUAVRef ClusterPageBufferUAV, const TArray<uint32>& PackedUpdates)
+	static void AddPass_UpdateClusterLeafFlags(FRDGBuilder& GraphBuilder, FRDGBufferUAVRef ClusterPageBufferUAV, const TArray<uint32>& PackedUpdates)
 	{
-		
+		const uint32 NumClusterUpdates = PackedUpdates.Num();
+		if (NumClusterUpdates == 0u)
+		{
+			return;
+		}
 
+		const uint32 NumUpdatesBufferElements = FMath::RoundUpToPowerOfTwo(NumClusterUpdates);
+		FRDGBufferRef UpdatesBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("GS.PackedClusterUpdateBuffer"), PackedUpdates.GetTypeSize(), 
+																NumUpdatesBufferElements, PackedUpdates.GetData(), PackedUpdates.Num() * PackedUpdates.GetTypeSize());
 
+		FUpdateClusterLeafFlags_CS::FParameters* PassParameters = GraphBuilder.AllocParameters<FUpdateClusterLeafFlags_CS::FParameters>();
+		PassParameters->NumClusterUpdates = NumClusterUpdates;
+		PassParameters->PackedClusterUpdates = GraphBuilder.CreateSRV(UpdatesBuffer);
+		PassParameters->ClusterPageBuffer = ClusterPageBufferUAV;
+
+		auto ComputeShader = GetGlobalShaderMap(GMaxRHIFeatureLevel)->GetShader<FUpdateClusterLeafFlags_CS>();
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("UpdateClusterLeafFlags"),
+			ComputeShader,
+			PassParameters,
+			FComputeShaderUtils::GetGroupCount(NumClusterUpdates, 64)
+		);
 	}
+
+	class FHierarchyDepthManager
+	{
+	public:
+		FHierarchyDepthManager(uint32 MaxDepth)
+		{
+			DepthHistogram.SetNumZeroed(MaxDepth + 1);
+		}
+
+		void Add(uint32 Depth)
+		{
+			++DepthHistogram[Depth];
+		}
+
+		void Remove(uint32 Depth)
+		{
+			uint32& Count = DepthHistogram[Depth];
+			check(Count > 0u);
+			--Count;
+		}
+
+		uint32 CalculateNumLevels() const
+		{
+			for (int32 Depth = uint32(DepthHistogram.Num() - 1); Depth >= 0; --Depth)
+			{
+				if (DepthHistogram[Depth] != 0u)
+				{
+					return uint32(Depth) + 1u;
+				}
+			}
+			return 0u;
+		}
+
+	private:
+		TArray<uint32> DepthHistogram;
+	};
 
 
 	struct FPackedClusterInstallInfo
@@ -263,7 +346,6 @@ IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/Gaussia
 			uint32 NumPages;
 			uint32 NumGaussians;
 		};
-
 
 	public:
 		FStreamingPageUploader()
@@ -923,6 +1005,11 @@ IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/Gaussia
 		FRDGBuffer* ClusterPageDataBuffer = ResizePoolAllocationIfNeeded(GraphBuilder);
 		ProcessNewResources(GraphBuilder, ClusterPageDataBuffer);
 
+		uint32 TotalPageSize;
+		AsyncState.NumReadyPages = DetermineReadyPages(TotalPageSize);
+
+
+
 		AsyncState.GPUStreamingRequestsPtr = ReadbackManager->LockLatest(AsyncState.NumGPUStreamingRequests);
 		ReadbackManager->PrepareRequestBuffer(GraphBuilder);
 
@@ -1212,7 +1299,181 @@ IMPLEMENT_GLOBAL_SHADER(FClearStreamingRequestCount_CS, "/Engine/Private/Gaussia
 		LRUToRegisteredPageIndex.SetNum(WriteIndex);
 	}
 
+	uint32 FStreamingManager::DetermineReadyPages(uint32& TotalPageSize)
+	{
+		LLM_SCOPE_BYTAG(GaussianSplatting);
+		TRACE_CPUPROFILER_EVENT_SCOPE(FStreamingManager::DetermineReadyPages);
 
+		const uint32 StartPendingPageIndex = (NextPendingPageIndex + MaxPendingPages - NumPendingPages) % MaxPendingPages;
+		uint32 NumReadyPages = 0;
+
+		uint64 UpdateTick = FPlatformTime::Cycles64();
+		uint64 DeltaTick = PrevUpdateTick ? UpdateTick - PrevUpdateTick : 0;
+		PrevUpdateTick = UpdateTick;
+
+		TotalPageSize = 0;
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(CheckReadyPages);
+
+			for (uint32 i = 0; i < NumPendingPages && NumReadyPages < MaxPendingPages; ++i)
+			{
+				uint32 PendingPageIndex = (StartPendingPageIndex + i) % MaxPendingPages;
+				FPendingPage& PendingPage = PendingPages[PendingPageIndex];
+				bool bFreePageFromStagingAllocator = false;
+
+				{
+					if (PendingPage.Request.IsCompleted())
+					{
+						if (!PendingPage.Request.IsOk())
+						{
+							FResources* Resources = GetResources(PendingPage.InstallKey.RuntimeResourceID);
+							if (Resources)
+							{
+								const FPageStreamingState& PageStreamingState = Resources->PageStreamingState[PendingPage.InstallKey.PageIndex];
+								FBulkDataBatchRequest::FBatchBuilder Batch = FBulkDataBatchRequest::NewBatch(1);
+
+								Batch.Read(Resources->StreamablePages, PageStreamingState.BulkOffset, PageStreamingState.BulkSize, AIOP_Low, PendingPage.RequestBuffer, PendingPage.Request);
+								Batch.Issue();
+								break;
+							}
+						}
+					}
+					else
+					{
+						break;
+					}
+				}
+
+				if (GGaussianSplattingStreamingBandwidthLimit >= 0.0f)
+				{
+					uint32 SimulatedBytesRemaining = FPlatformTime::ToSeconds64(DeltaTick) * GGaussianSplattingStreamingBandwidthLimit * 1048576.0f;
+					uint32 SimulatedBytesRead = FMath::Min(PendingPage.BytesLeftToStream, SimulatedBytesRemaining);
+					PendingPage.BytesLeftToStream -= SimulatedBytesRead;
+					SimulatedBytesRemaining -= SimulatedBytesRead;
+					if(PendingPage.BytesLeftToStream > 0)
+						break;
+				}
+
+				if (bFreePageFromStagingAllocator)
+				{
+					PendingPageStagingAllocator->Free(PendingPage.RequestBuffer.DataSize());
+				}
+
+				FResources* Resources = GetResources(PendingPage.InstallKey.RuntimeResourceID);
+				if (Resources)
+				{
+					const FPageStreamingState& PageStreamingState = Resources->PageStreamingState[PendingPage.InstallKey.PageIndex];
+					TotalPageSize += PageStreamingState.PageSize;
+				}
+
+				++NumReadyPages;
+			}
+		}
+
+		return NumReadyPages;
+	}
+
+	void FStreamingManager::InstallReadyPages(uint32 NumReadyPages)
+	{
+		LLM_SCOPE_BYTAG(GaussianSplatting);
+		TRACE_CPUPROFILER_EVENT_SCOPE(FStreamingManager::InstallReadyPages);
+		SCOPE_CYCLE_COUNTER(STAT_GaussianSplattingStreaming_InstallReadyPages);
+
+		if(NumReadyPages == 0)
+			return;
+
+		const uint32 StartPendingPageIndex = (NextPendingPageIndex + MaxPendingPages - NumPendingPages) % MaxPendingPages;
+
+		struct FUploadTask
+		{
+			FPendingPage* PendingPage = nullptr;
+			uint8* Dst = nullptr;
+			const uint8* Src = nullptr;
+			uint32 SrcSize = 0;
+		};
+
+		TArray<FUploadTask> UploadTasks;
+		UploadTasks.AddDefaulted(NumReadyPages);
+
+		{
+			TMap<uint32, uint32> GPUPageToLastPendingPageIndex;
+			for (uint32 i = 0; i < NumReadyPages; ++i)
+			{
+				uint32 PendingPageIndex = (StartPendingPageIndex + i) % MaxPendingPages;
+				FPendingPage& PendingPage = PendingPages[PendingPageIndex];
+
+				GPUPageToLastPendingPageIndex.Add(PendingPage.GPUPageIndex, PendingPageIndex);
+			}
+
+			TSet<FPageKey> BatchNewPageKeys;
+			for (auto& Elem : GPUPageToLastPendingPageIndex)
+			{
+				uint32 GPUPageIndex = Elem.Key;
+
+				FResidentPage& ResidentPage = ResidentPages[GPUPageIndex];
+				if (ResidentPage.Key.RuntimeResourceID != INDEX_NONE)
+				{
+					ResidentPageMap.Remove(ResidentPage.Key);
+				}
+
+				FPendingPage& PendingPage = PendingPages[Elem.Value];
+				BatchNewPageKeys.Add(PendingPage.InstallKey);
+			}
+
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(UninstallFixup);
+				for (auto& Elem : GPUPageToLastPendingPageIndex)
+				{
+					const uint32 GPUPageIndex = Elem.Key;
+
+					const bool bApplyFixup = !BatchNewPageKeys.Contains(ResidentPages[GPUPageIndex].Key);
+					UninstallGPUPage(GPUPageIndex, bApplyFixup);
+				}
+			}
+
+			for(auto& Elem : GPUPageToLastPendingPageIndex)
+			{
+				uint32 GPUPageIndex = Elem.Key;
+				uint32 LastPendingPageIndex = Elem.Value;
+				FPendingPage& PendingPage = PendingPages[LastPendingPageIndex];
+
+				FResources* Resources = GetResources(PendingPage.InstallKey.RuntimeResourceID);
+				if (Resources)
+				{
+					ResidentPageMap.Add(PendingPage.InstallKey, GPUPageIndex);
+				}
+			}
+
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(InstallReadyPages);
+				uint32 NumInstalledPages = 0;
+				for (uint32 TaskIndex = 0; TaskIndex < NumReadyPages; ++TaskIndex)
+				{
+					uint32 PendingPageIndex = (StartPendingPageIndex + TaskIndex) % MaxPendingPages;
+				}
+
+
+			}
+
+		}
+
+	}
+
+	void FStreamingManager::UninstallGPUPage(uint32 GPUPageIndex, bool bApplyFixup)
+	{
+
+	}
+	
+	void FStreamingManager::AddClusterLeafFlagUpdate(uint32 MaxStreamingPages, uint32 GPUPageIndex, uint32 ClusterIndex, uint32 NumCluster, bool bReset, bool bUninstall)
+	{
+
+	}
+
+	void FStreamingManager::FlushClusterLeafFlagUpdates(FRDGBuilder& GraphBuilder, FRDGBuffer* ClusterPageDataBuffer)
+	{
+		AddPass_UpdateClusterLeafFlags(GraphBuilder, GraphBuilder.CreateUAV(ClusterPageDataBuffer), ClusterLeafFlagUpdates);
+		ClusterLeafFlagUpdates.Empty();
+	}
 
 	void FStreamingManager::AddParentRequests()
 	{

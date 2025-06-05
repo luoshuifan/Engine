@@ -1751,6 +1751,8 @@ void FDeferredShadingSceneRenderer::Render(FRDGBuilder& GraphBuilder)
 			Nanite::GStreamingManager.BeginAsyncUpdate(GraphBuilder);
 		}
 
+
+
 		FNaniteVisualizationData& NaniteVisualization = GetNaniteVisualizationData();
 		if (Views.Num() > 0)
 		{
